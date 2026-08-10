@@ -1,0 +1,6 @@
+{
+  "name": "CodeForge V2",
+  "description": "AI-native multi-agent software development environment orchestrating Architect, Coder, Security Scan, and Code Review agents.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
