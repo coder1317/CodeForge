@@ -3,7 +3,19 @@ import { usePipelineStore } from '../store/pipelineStore';
 import { Network, Code2, ShieldAlert, CheckCircle2, Clock, Cpu, RefreshCw, AlertCircle, Hammer, Bug } from 'lucide-react';
 
 export const AgentGraph: React.FC = () => {
-  const { pipelineStatus, activeAgent, activeProvider, activeModel, fileTree, currentFileIndex, reviewResult } = usePipelineStore();
+  const {
+    pipelineStatus,
+    activeAgent,
+    activeProvider,
+    activeModel,
+    fileTree,
+    currentFileIndex,
+    reviewResult,
+    iterationCount,
+    maxIterations,
+    buildAttempts,
+    maxBuildAttempts
+  } = usePipelineStore();
 
   const agents = [
     {
@@ -165,23 +177,47 @@ export const AgentGraph: React.FC = () => {
 
       {/* Pipeline Progress details */}
       {fileTree.length > 0 && (
-        <div className="mt-3 pt-2 border-t border-slate-800/80 flex items-center justify-between text-xs text-slate-400">
-          <div className="flex items-center gap-2">
-            <span>Files Processed:</span>
-            <span className="font-mono text-slate-200 font-semibold">
-              {Math.min(currentFileIndex + 1, fileTree.length)} / {fileTree.length}
-            </span>
-          </div>
-          {reviewResult && (
+        <div className="mt-3 pt-2 border-t border-slate-800/80 flex flex-col gap-1.5 text-xs text-slate-400">
+          <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <span>Overall Review Grade:</span>
-              <span className={`px-2 py-0.5 rounded font-bold font-mono text-xs ${
-                reviewResult.overallScore >= 90 ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' :
-                reviewResult.overallScore >= 75 ? 'bg-blue-950 text-blue-400 border border-blue-800' :
-                'bg-amber-950 text-amber-400 border border-amber-800'
-              }`}>
-                {reviewResult.overallGrade} ({reviewResult.overallScore}/100)
+              <span>Files Processed:</span>
+              <span className="font-mono text-slate-200 font-semibold">
+                {Math.min(currentFileIndex + 1, fileTree.length)} / {fileTree.length}
               </span>
+            </div>
+            {reviewResult && (
+              <div className="flex items-center gap-2">
+                <span>Overall Review Grade:</span>
+                <span className={`px-2 py-0.5 rounded font-bold font-mono text-xs ${
+                  reviewResult.overallScore >= 90 ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' :
+                  reviewResult.overallScore >= 75 ? 'bg-blue-950 text-blue-400 border border-blue-800' :
+                  'bg-amber-950 text-amber-400 border border-amber-800'
+                }`}>
+                  {reviewResult.overallGrade} ({reviewResult.overallScore}/100)
+                </span>
+              </div>
+            )}
+          </div>
+          {(iterationCount > 0 || buildAttempts > 0) && (
+            <div className="flex items-center gap-3 text-[10px]">
+              {iterationCount > 0 && maxIterations > 0 && (
+                <span className={`px-1.5 py-0.5 rounded border font-medium ${
+                  pipelineStatus === 'coding' || pipelineStatus === 'securing'
+                    ? 'bg-amber-950/60 text-amber-400 border-amber-800 animate-pulse'
+                    : 'bg-slate-800 text-slate-400 border-slate-700'
+                }`}>
+                  Fix loop: round {iterationCount}/{maxIterations}
+                </span>
+              )}
+              {buildAttempts > 0 && maxBuildAttempts > 0 && (
+                <span className={`px-1.5 py-0.5 rounded border font-medium ${
+                  pipelineStatus === 'debugging' || (pipelineStatus === 'building' && buildAttempts > 1)
+                    ? 'bg-violet-950/60 text-violet-300 border-violet-800 animate-pulse'
+                    : 'bg-slate-800 text-slate-400 border-slate-700'
+                }`}>
+                  Repair rounds: {buildAttempts}/{Math.max(maxBuildAttempts - 1, 0)}
+                </span>
+              )}
             </div>
           )}
         </div>

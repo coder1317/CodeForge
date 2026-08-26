@@ -97,6 +97,11 @@ export interface PipelineState {
   maxIterations: number;
   /** Build-repair rounds consumed so far (bounded by maxBuildAttempts). */
   buildAttempts: number;
+  /**
+   * Total build budget. Repairs only run when a rebuild can follow
+   * (verified-repair invariant), so this allows maxBuildAttempts builds and
+   * at most maxBuildAttempts - 1 repair rounds.
+   */
   maxBuildAttempts: number;
 }
 
@@ -112,5 +117,5 @@ export const initialPipelineState: PipelineState = {
   iterationCount: 0,
   maxIterations: 2,
   buildAttempts: 0,
-  maxBuildAttempts: 2
+  maxBuildAttempts: 3
 };

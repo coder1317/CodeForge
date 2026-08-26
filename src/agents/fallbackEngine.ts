@@ -533,9 +533,105 @@ export function logInfo(msg) {
 `;
 }
 
+/** A single deterministic SAST rule used by the fallback scanner. */
+interface ScanRule {
+  id: string;
+  severity: SecurityIssue['severity'];
+  type: string;
+  message: string;
+  recommendation: string;
+  /** Matched against the whole file body. */
+  re: RegExp;
+}
+
+/**
+ * Rule-based OWASP heuristics. This scanner is the SAFETY NET that runs
+ * whenever the LLM scanner fails or returns garbage — and the ONLY scan that
+ * build-repair rounds get — so it must catch the classic vulnerability
+ * classes deterministically without an LLM.
+ */
+const SCAN_RULES: ScanRule[] = [
+  {
+    id: 'SEC-EVAL',
+    severity: 'critical',
+    type: 'Code Injection',
+    message: 'Use of eval() executes arbitrary strings as code — a critical remote-code-execution vector.',
+    recommendation: 'Remove eval(); use JSON.parse, explicit lookup maps, or a purpose-built parser instead.',
+    re: /\beval\s*\(/
+  },
+  {
+    id: 'SEC-FNCONSTRUCTOR',
+    severity: 'critical',
+    type: 'Code Injection',
+    message: 'new Function() compiles arbitrary strings into executable code, equivalent to eval().',
+    recommendation: 'Replace new Function() with static functions or a safe expression evaluator.',
+    re: /\bnew\s+Function\s*\(/
+  },
+  {
+    id: 'SEC-CMDINJ',
+    severity: 'high',
+    type: 'Command Injection',
+    message: 'Shell command built from interpolated/concatenated values — injected input can execute arbitrary commands.',
+    recommendation: 'Avoid string-built shell commands; pass an argv array to execFile/spawn without a shell.',
+    re: /\bexec(?:Sync)?\s*\([^)]*(?:`\$\{|\$\{|['"]\s*\+)/
+  },
+  {
+    id: 'SEC-XSS-INNERHTML',
+    severity: 'high',
+    type: 'Cross-Site Scripting (XSS)',
+    message: 'Direct innerHTML assignment renders unsanitized HTML — user data here enables script injection.',
+    recommendation: 'Use textContent, sanitize with DOMPurify, or build DOM nodes programmatically.',
+    re: /\.innerHTML\s*=/
+  },
+  {
+    id: 'SEC-XSS-DANGEROUS',
+    severity: 'high',
+    type: 'Cross-Site Scripting (XSS)',
+    message: 'dangerouslySetInnerHTML injects raw HTML into the DOM — unsanitized data enables XSS.',
+    recommendation: 'Render content as text or sanitize the HTML before injecting it.',
+    re: /dangerouslySetInnerHTML/
+  },
+  {
+    id: 'SEC-WEAKHASH',
+    severity: 'medium',
+    type: 'Insecure Cryptography',
+    message: 'MD5/SHA-1 are cryptographically broken — unsuitable for passwords, tokens, or signatures.',
+    recommendation: 'Use bcrypt/argon2 for passwords and SHA-256+ for hashing.',
+    re: /\b(md5|sha1)\b|createHash\(\s*['"](md5|sha1)['"]\s*\)/i
+  },
+  {
+    id: 'SEC-CORSWILD',
+    severity: 'medium',
+    type: 'CORS Misconfiguration',
+    message: 'CORS configured with a wildcard origin allows any website to call this API with user credentials.',
+    recommendation: 'Restrict origin to an explicit allow-list of trusted domains.',
+    re: /origin\s*:\s*['"]\*['"]/
+  },
+  {
+    id: 'SEC-WEAKRANDOM',
+    severity: 'medium',
+    type: 'Insecure Randomness',
+    message: 'Security-sensitive value derived from Math.random(), which is predictable and not cryptographically secure.',
+    recommendation: 'Use crypto.randomBytes / crypto.getRandomValues for tokens, secrets, and nonces.',
+    re: /(token|secret|password|nonce|otp|session_?id)[^\n]{0,40}Math\.random|Math\.random[^\n]{0,40}(token|secret|password)/i
+  }
+];
+
+/** Regex that matches hardcoded credential assignments (per-line scanning). */
+const HARDCODED_SECRET_RE =
+  /\b(password|passwd|pwd|secret|api_?key|apikey|auth_?token|access_?token|private_?key|client_?secret|encryption_?key)\s*["']?\s*[:=]\s*["']([^"'\n]{4,})["']/i;
+
+/** Find the 1-based line number of the first match of a regex in code. */
+function firstMatchLine(code: string, re: RegExp): number | undefined {
+  const m = code.match(re);
+  if (!m || m.index === undefined) return undefined;
+  return code.slice(0, m.index).split('\n').length;
+}
+
 export function fallbackSecurityScan(filePath: string, code: string): SecurityIssue[] {
   const issues: SecurityIssue[] = [];
 
+  // Legacy checks preserved for compatibility with existing findings consumers.
   if (code.includes('dev_fallback_secret_change_in_production') || code.includes('secret = "')) {
     issues.push({
       id: 'SEC-001',
@@ -556,6 +652,41 @@ export function fallbackSecurityScan(filePath: string, code: string): SecurityIs
       message: 'Direct usage of req.body properties without explicit schema validation.',
       recommendation: 'Implement Zod or express-validator middleware to enforce request body type safety.'
     });
+  }
+
+  // Hardcoded credentials — scanned PER LINE so assignments pulled from
+  // process.env on the same line don't trigger false positives.
+  const lines = code.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/process\.env/.test(line)) continue;
+    const m = line.match(HARDCODED_SECRET_RE);
+    if (m) {
+      issues.push({
+        id: 'SEC-HARDCRED',
+        line: i + 1,
+        severity: 'high',
+        type: 'Hardcoded Credential',
+        message: `Credential "${m[1]}" appears to be hardcoded as a literal string.`,
+        recommendation: 'Load credentials from environment variables or a secret manager; rotate any committed values.'
+      });
+      break; // one finding per file is enough signal
+    }
+  }
+
+  // Deterministic rule sweep.
+  for (const rule of SCAN_RULES) {
+    const m = code.match(rule.re);
+    if (m) {
+      issues.push({
+        id: rule.id,
+        line: firstMatchLine(code, rule.re),
+        severity: rule.severity,
+        type: rule.type,
+        message: rule.message,
+        recommendation: rule.recommendation
+      });
+    }
   }
 
   return issues;

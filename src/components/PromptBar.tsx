@@ -1,9 +1,9 @@
 import React, { useState } from 'react';
 import { usePipelineStore } from '../store/pipelineStore';
-import { Send, Sparkles, Terminal, ChevronUp, ChevronDown, RefreshCw } from 'lucide-react';
+import { Send, Sparkles, Terminal, ChevronUp, ChevronDown, Square } from 'lucide-react';
 
 export const PromptBar: React.FC = () => {
-  const { prompt, setPrompt, startGeneration, pipelineStatus, logs } = usePipelineStore();
+  const { prompt, setPrompt, startGeneration, cancelGeneration, pipelineStatus, logs } = usePipelineStore();
   const [showLogs, setShowLogs] = useState(false);
 
   const isRunning = pipelineStatus !== 'idle' && pipelineStatus !== 'completed' && pipelineStatus !== 'failed';
@@ -96,23 +96,26 @@ export const PromptBar: React.FC = () => {
           />
         </div>
 
-        <button
-          type="submit"
-          disabled={!prompt.trim() || isRunning}
-          className="flex items-center gap-1.5 sm:gap-2 px-3 sm:px-4 py-2.5 bg-gradient-to-r from-indigo-600 to-indigo-700 hover:from-indigo-500 hover:to-indigo-600 disabled:opacity-50 text-white font-semibold text-xs rounded-lg transition-all shadow-md shadow-indigo-600/20 cursor-pointer shrink-0"
-        >
-          {isRunning ? (
-            <>
-              <RefreshCw className="w-4 h-4 animate-spin" />
-              <span>Generating...</span>
-            </>
-          ) : (
-            <>
-              <Send className="w-4 h-4" />
-              <span>Run <span className="hidden sm:inline">Agent Pipeline</span><span className="sm:hidden">Pipeline</span></span>
-            </>
-          )}
-        </button>
+        {isRunning ? (
+          <button
+            type="button"
+            onClick={cancelGeneration}
+            title="Stop the agent pipeline (partial results are kept)"
+            className="flex items-center gap-1.5 sm:gap-2 px-3 sm:px-4 py-2.5 bg-gradient-to-r from-rose-600 to-rose-700 hover:from-rose-500 hover:to-rose-600 text-white font-semibold text-xs rounded-lg transition-all shadow-md shadow-rose-600/20 cursor-pointer shrink-0"
+          >
+            <Square className="w-3.5 h-3.5 fill-current" />
+            <span>Stop</span>
+          </button>
+        ) : (
+          <button
+            type="submit"
+            disabled={!prompt.trim()}
+            className="flex items-center gap-1.5 sm:gap-2 px-3 sm:px-4 py-2.5 bg-gradient-to-r from-indigo-600 to-indigo-700 hover:from-indigo-500 hover:to-indigo-600 disabled:opacity-50 text-white font-semibold text-xs rounded-lg transition-all shadow-md shadow-indigo-600/20 cursor-pointer shrink-0"
+          >
+            <Send className="w-4 h-4" />
+            <span>Run <span className="hidden sm:inline">Agent Pipeline</span><span className="sm:hidden">Pipeline</span></span>
+          </button>
+        )}
       </form>
     </div>
   );

@@ -120,7 +120,7 @@ const ERROR_RE = /(?:error|failed|✗|Error:|Module not found|Cannot find|Can't 
 const FILE_RE = /([\w@./-]+\.(?:tsx?|jsx?|js|mjs|cjs|css|json|html))/i;
 
 /** Pull concise, actionable error lines + implicated file paths out of command output. */
-function extractIssues(stdout: string, stderr: string): { errors: string[]; failingFiles: string[] } {
+export function extractIssues(stdout: string, stderr: string): { errors: string[]; failingFiles: string[] } {
   const combined = `${stderr}\n${stdout}`;
   const lines = combined.split('\n');
   const errors: string[] = [];

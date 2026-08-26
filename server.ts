@@ -27,8 +27,23 @@ function isRateLimited(ip: string): boolean {
   if (list.length >= GEN_MAX_REQUESTS) return true;
   list.push(now);
   genTimestamps.set(ip, list);
+  // Periodic sweep: drop stale entries so the map can't grow unboundedly
+  // when many distinct client IPs appear over a long uptime.
+  if (now - lastLimiterSweep > GEN_WINDOW_MS) {
+    lastLimiterSweep = now;
+    for (const [key, stamps] of genTimestamps) {
+      const fresh = stamps.filter((t) => now - t < GEN_WINDOW_MS);
+      if (fresh.length === 0) genTimestamps.delete(key);
+      else genTimestamps.set(key, fresh);
+    }
+  }
   return false;
 }
+let lastLimiterSweep = Date.now();
+
+// Active generation abort controllers — used by graceful shutdown to cancel
+// every in-flight pipeline when the process is asked to terminate.
+const activeGenerationControllers = new Set<AbortController>();
 
 async function startServer() {
   const app = express();
@@ -42,6 +57,22 @@ async function startServer() {
 
   app.use(cors({ origin: allowedOrigins }));
   app.use(express.json({ limit: '256kb' }));
+
+  // Behind a reverse proxy (nginx/Cloudflare), trust the proxy's X-Forwarded-For
+  // so req.ip reflects the real client and per-IP rate limits work per client.
+  if (process.env.TRUST_PROXY === '1') {
+    app.set('trust proxy', 1);
+  }
+
+  // Liveness/readiness probe for uptime monitors and container orchestrators.
+  app.get('/api/health', (_req, res) => {
+    res.json({
+      ok: true,
+      uptimeSec: Math.round(process.uptime()),
+      activeGenerations,
+      timestamp: new Date().toISOString()
+    });
+  });
 
   // API Route: Provider Status & Health Check
   app.get('/api/providers/status', async (req, res) => {
@@ -92,10 +123,15 @@ async function startServer() {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // disable nginx response buffering
     res.flushHeaders();
 
     const sendSSE = (event: string, data: unknown) => {
-      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+      try {
+        res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+      } catch {
+        // socket already gone — the close handler will abort the pipeline
+      }
     };
 
     const initialState: PipelineState = {
@@ -133,6 +169,18 @@ async function startServer() {
     const controller = new AbortController();
     const onClose = () => controller.abort();
     res.on('close', onClose);
+    activeGenerationControllers.add(controller);
+
+    // SSE heartbeat: during long LLM calls (up to 150s) no bytes flow, which
+    // lets intermediate proxies time the connection out. A comment frame keeps
+    // the socket warm without disturbing EventSource parsers.
+    const heartbeat = setInterval(() => {
+      try {
+        res.write(':hb\n\n');
+      } catch {
+        // socket gone; close handler aborts the pipeline
+      }
+    }, 15_000);
 
     try {
       for await (const step of orchestrator.runStream(controller.signal)) {
@@ -153,7 +201,9 @@ async function startServer() {
         sendSSE('error', { error: errMsg });
       }
     } finally {
+      clearInterval(heartbeat);
       activeGenerations--;
+      activeGenerationControllers.delete(controller);
       res.removeListener('close', onClose);
       res.end();
     }
@@ -191,11 +241,33 @@ async function startServer() {
     }
   });
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`CodeForge V2 server running on http://0.0.0.0:${PORT}`);
+  const HOST = process.env.HOST || '127.0.0.1';
+  const server = app.listen(PORT, HOST, () => {
+    console.log(`CodeForge V2 server running on http://${HOST}:${PORT}`);
     // Fire-and-forget: discover installed Ollama models for the provider selector.
     refreshOllamaModels().catch(() => {});
   });
+
+  // Graceful shutdown: stop accepting connections, abort every in-flight
+  // generation (no half-written pipelines), and exit once drained.
+  let shuttingDown = false;
+  const shutdown = (signalName: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`\n[${signalName}] Shutting down CodeForge...`);
+    for (const c of activeGenerationControllers) {
+      try {
+        c.abort();
+      } catch {
+        // already aborted
+      }
+    }
+    server.close(() => process.exit(0));
+    // Hard exit if something refuses to drain (e.g. a stuck keep-alive socket).
+    setTimeout(() => process.exit(0), 5_000).unref();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
 startServer();

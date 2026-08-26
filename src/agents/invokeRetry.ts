@@ -11,6 +11,11 @@ export interface RetryInvocationParams {
   systemPrompt: string;
   userPrompt: string;
   signal?: AbortSignal;
+  /**
+   * Escalation mode (retry rounds): prefer keyed cloud providers over the
+   * local/free ones that already failed, so round 2 doesn't repeat round 1.
+   */
+  escalate?: boolean;
 }
 
 export interface RetryInvocationResult {
@@ -30,6 +35,10 @@ const TASK_MAX_ATTEMPTS: Record<TaskType, number> = {
   debug: 3
 };
 
+// Cold-start guard: the very first LLM invocation of a process always awaits
+// one Ollama model-detection round, even when cloud keys are present.
+let ollamaWarmedOnce = false;
+
 /**
  * Try the preferred provider for a task, then automatically fall through the
  * provider pool (by priority order) until one succeeds. Only throws when every
@@ -37,7 +46,7 @@ const TASK_MAX_ATTEMPTS: Record<TaskType, number> = {
  * engine, so the pipeline never dies and never silently writes garbage.
  */
 export async function invokeWithProviderRetry(params: RetryInvocationParams): Promise<RetryInvocationResult> {
-  const { taskType, byokKeys, envVars, systemPrompt, userPrompt, signal } = params;
+  const { taskType, byokKeys, envVars, systemPrompt, userPrompt, signal, escalate } = params;
   const tried: string[] = [];
   let lastError: unknown = new Error('No provider available');
 
@@ -51,14 +60,23 @@ export async function invokeWithProviderRetry(params: RetryInvocationParams): Pr
 
   // Warm the Ollama model cache so the selector knows which local models are
   // actually installed instead of falling back to a model that may not exist.
-  // Skip when the user has configured keyed cloud providers — Ollama is then
-  // usually irrelevant and we avoid an up-to-2.5s detection call per node.
+  // The FIRST invocation of a process always awaits detection (cold-start fix:
+  // otherwise the selector can pick a model that isn't installed). After that,
+  // TTL-cached refreshes only run when no cloud keys are configured — with keys
+  // present, Ollama is usually irrelevant and we skip the per-node check.
   const hasCloudKeys = Boolean(
     byokKeys && Object.values(byokKeys).some((k) => k && k.trim() !== '' && k !== 'unused') ||
     envVars && ['GROQ_API_KEY', 'NVIDIA_API_KEY', 'CEREBRAS_API_KEY', 'MISTRAL_API_KEY', 'GEMINI_API_KEY', 'CHUTES_API_KEY', 'LLM7_API_KEY']
       .some((name) => envVars[name])
   );
-  if (!hasCloudKeys) {
+  if (!ollamaWarmedOnce) {
+    ollamaWarmedOnce = true;
+    try {
+      await refreshOllamaModels();
+    } catch {
+      // detection failure is non-fatal; selector will fall back gracefully
+    }
+  } else if (!hasCloudKeys) {
     try {
       await refreshOllamaModels();
     } catch {
@@ -92,7 +110,7 @@ export async function invokeWithProviderRetry(params: RetryInvocationParams): Pr
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     throwIfAborted();
-    const selection: ProviderSelectionResult | null = selectProvider(taskType, byokKeys, envVars, tried);
+    const selection: ProviderSelectionResult | null = selectProvider(taskType, byokKeys, envVars, tried, escalate);
     if (!selection || tried.includes(selection.provider.id)) break;
     tried.push(selection.provider.id);
 

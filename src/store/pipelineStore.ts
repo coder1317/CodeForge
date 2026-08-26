@@ -53,9 +53,15 @@ interface PipelineStore extends PipelineState {
   setActiveTab: (tab: 'editor' | 'review' | 'logs' | 'history') => void;
   resetPipeline: () => void;
   startGeneration: () => Promise<void>;
+  /** Abort the in-flight generation (server cancels the pipeline immediately). */
+  cancelGeneration: () => void;
   fetchProviderStatuses: () => Promise<void>;
   loadHistoryItem: (item: ProjectHistoryItem) => void;
 }
+
+// Handle to the currently running generation request, enabling user-initiated
+// cancellation. The server aborts the whole pipeline when this fetch drops.
+let activeController: AbortController | null = null;
 
 export const usePipelineStore = create<PipelineStore>((set, get) => ({
   ...initialPipelineState,
@@ -130,10 +136,13 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
     });
 
     try {
+      const controller = new AbortController();
+      activeController = controller;
       const response = await fetch('/api/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt, byokKeys })
+        body: JSON.stringify({ prompt, byokKeys }),
+        signal: controller.signal
       });
 
       if (!response.ok || !response.body) {
@@ -153,13 +162,22 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
         buffer = lines.pop() || '';
 
         for (const line of lines) {
-          if (!line.trim()) continue;
-          
+          if (!line.trim() || line.startsWith(':')) continue; // skip empty + heartbeat comments
+
           const eventMatch = line.match(/^event:\s*(.+)$/m);
           const dataMatch = line.match(/^data:\s*(.+)$/m);
 
           const event = eventMatch ? eventMatch[1].trim() : 'message';
-          const data = dataMatch ? JSON.parse(dataMatch[1]) : {};
+
+          // Per-event isolation: one malformed frame must never kill the
+          // whole stream parse (the server may interleave heartbeats etc.).
+          let data: unknown;
+          try {
+            data = dataMatch ? JSON.parse(dataMatch[1]) : {};
+          } catch {
+            console.warn('Skipping malformed SSE event:', line.slice(0, 120));
+            continue;
+          }
 
           if (event === 'log') {
             set((state) => ({ logs: [...state.logs, data as LogMessage] }));
@@ -199,8 +217,9 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
         }
       }
     } catch (err: unknown) {
-      console.error('SSE Stream error:', err);
-      const errMsg = err instanceof Error ? err.message : String(err);
+      const cancelled = err instanceof Error && (err.name === 'AbortError' || activeController?.signal.aborted === true);
+      if (!cancelled) console.error('SSE Stream error:', err);
+      activeController = null;
       set((state) => ({
         pipelineStatus: 'failed',
         activeAgent: null,
@@ -209,14 +228,24 @@ export const usePipelineStore = create<PipelineStore>((set, get) => ({
           {
             id: 'log_err_' + Date.now(),
             timestamp: new Date().toLocaleTimeString(),
-            agent: 'Orchestrator',
-            provider: 'Error Handler',
-            message: `Pipeline encountered an error: ${errMsg}`,
-            type: 'error'
+            agent: 'Orchestrator' as const,
+            provider: cancelled ? 'CodeForge Engine' : 'Error Handler',
+            message: cancelled
+              ? 'Generation cancelled by user. Partial results are kept below.'
+              : `Pipeline encountered an error: ${err instanceof Error ? err.message : String(err)}`,
+            type: (cancelled ? 'warn' : 'error') as 'warn' | 'error'
           }
         ]
       }));
+    } finally {
+      activeController = null;
     }
+  },
+
+  cancelGeneration: () => {
+    const controller = activeController;
+    if (!controller) return;
+    controller.abort();
   },
 
   loadHistoryItem: (item) => {

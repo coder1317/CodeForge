@@ -17,11 +17,25 @@ export interface NodeOptions {
   debugDirective?: string;
   /** Marks the single, build-aware project-wide review at the end of the pipeline. */
   finalReview?: boolean;
-  /** External abort signal (e.g. client disconnect). */
+  /** External abort signal (e.g. client disconnect or user-initiated stop). */
   signal?: AbortSignal;
+  /**
+   * Escalation mode: prefer keyed cloud providers over the free/local ones
+   * that already failed in a previous round.
+   */
+  escalate?: boolean;
 }
 
 type Grade = CodeReviewResult['overallGrade'];
+
+/**
+ * AbortErrors (client disconnect / user stop) must NEVER be swallowed by a
+ * node's fallback path — they must propagate so the orchestrator stops
+ * immediately instead of grinding through remaining files with fallback code.
+ */
+function isAbortError(err: unknown): boolean {
+  return err instanceof Error && err.name === 'AbortError';
+}
 
 function gradeFromScore(score: number): Grade {
   if (score >= 95) return 'A+';
@@ -33,7 +47,7 @@ function gradeFromScore(score: number): Grade {
 }
 
 /** Derive an honest per-file grade from its actual SAST findings. */
-function deriveFileGrade(issues?: SecurityIssue[]): { grade: string; score: number } {
+export function deriveFileGrade(issues?: SecurityIssue[]): { grade: string; score: number } {
   const sev = issues || [];
   let score = 92;
   for (const issue of sev) {
@@ -168,7 +182,7 @@ async function checkProjectSyntax(files: Record<string, string>): Promise<Syntax
  * markdown-fenced, and plain-text output — and refuses to let the unparseable
  * JSON wrapper (`{"path": ..., "code": ...}`) leak into generated files.
  */
-function extractCode(raw: string): string | null {
+export function extractCode(raw: string): string | null {
   const trimmed = raw.trim();
   if (!trimmed) return null;
 
@@ -209,6 +223,7 @@ export async function architectNode(state: PipelineState, options: NodeOptions =
       taskType: 'architect',
       byokKeys: options.byokKeys,
       envVars: options.envVars,
+      signal: options.signal,
       systemPrompt: ARCHITECT_PROMPT,
       userPrompt: `User Project Prompt: "${state.prompt}"`
     });
@@ -241,6 +256,7 @@ export async function architectNode(state: PipelineState, options: NodeOptions =
       }]
     };
   } catch (err) {
+    if (isAbortError(err)) throw err;
     console.warn('[ArchitectNode] LLM call failed, employing fallback architect synthesis engine:', err);
     const fallback = fallbackArchitect(state.prompt);
     const formattedFiles: AgentFile[] = fallback.files.map(f => ({
@@ -323,6 +339,8 @@ export async function coderNode(state: PipelineState, options: NodeOptions = {})
       taskType: 'code',
       byokKeys: options.byokKeys,
       envVars: options.envVars,
+      signal: options.signal,
+      escalate: options.escalate,
       systemPrompt: 'You are the Coder agent. Output strict JSON only.',
       userPrompt
     });
@@ -337,6 +355,7 @@ export async function coderNode(state: PipelineState, options: NodeOptions = {})
       code = fallbackCoder(currentFile.path, state.prompt, state.stack, state.generatedFiles);
     }
   } catch (err) {
+    if (isAbortError(err)) throw err;
     console.warn(`[CoderNode] Code generation failed for ${currentFile.path}, using fallback engine:`, err);
     usedTemplateFallback = true;
     code = fallbackCoder(currentFile.path, state.prompt, state.stack, state.generatedFiles);
@@ -396,6 +415,7 @@ export async function securityScanNode(state: PipelineState, options: NodeOption
       taskType: 'security',
       byokKeys: options.byokKeys,
       envVars: options.envVars,
+      signal: options.signal,
       systemPrompt: 'You are a SAST security scanner. Output strict JSON only.',
       userPrompt
     });
@@ -433,6 +453,7 @@ export async function securityScanNode(state: PipelineState, options: NodeOption
       }]
     };
   } catch (err) {
+    if (isAbortError(err)) throw err;
     console.warn(`[SecurityScanNode] Failed for ${currentFile.path}, using fallback scanner:`, err);
     const issues = fallbackSecurityScan(currentFile.path, currentFile.code);
 
@@ -558,6 +579,7 @@ export async function codeReviewNode(state: PipelineState, options: NodeOptions 
       taskType: 'review',
       byokKeys: options.byokKeys,
       envVars: options.envVars,
+      signal: options.signal,
       systemPrompt: 'You are a senior Code Reviewer agent. Output strict JSON only.',
       userPrompt
     });
@@ -599,6 +621,7 @@ export async function codeReviewNode(state: PipelineState, options: NodeOptions 
       }]
     };
   } catch (err) {
+    if (isAbortError(err)) throw err;
     console.warn('[CodeReviewNode] Review LLM failed, using fallback reviewer:', err);
     let reviewResult = fallbackCodeReview(state.generatedFiles);
 
@@ -732,6 +755,8 @@ export async function debuggerNode(state: PipelineState, options: NodeOptions = 
       taskType: 'debug',
       byokKeys: options.byokKeys,
       envVars: options.envVars,
+      signal: options.signal,
+      escalate: options.escalate,
       systemPrompt: 'You are the Debugger agent. Output strict JSON only.',
       userPrompt
     });
@@ -757,6 +782,7 @@ export async function debuggerNode(state: PipelineState, options: NodeOptions = 
       }]
     };
   } catch (err) {
+    if (isAbortError(err)) throw err;
     console.warn('[DebuggerNode] Debug LLM failed, using heuristic debugger:', err);
     const plan = fallbackDebugPlan(build);
     return {

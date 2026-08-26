@@ -32,16 +32,39 @@ export async function invokeLLM(params: LLMInvocationParams): Promise<string> {
   // Zero-key providers pass a fixed placeholder; keyed providers pass their real key.
   const effectiveKey = apiKey || process.env.OPENAI_API_KEY || 'unused';
 
-  const url = `${provider.baseUrl.replace(/\/+$/, '')}/chat/completions`;
-  const payload = {
-    model,
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt }
-    ],
-    temperature: 0.2,
-    max_tokens: 4096
-  };
+  // Ollama speaks OpenAI-compatible chat completions, but that endpoint hard-codes
+  // num_ctx to 4096 — the model's advertised 128K context never materializes and
+  // long prompts (coder's {OTHER_FILES} digest + full file output, security scan
+  // with complete file bodies) get silently truncated, producing unparseable JSON
+  // that the pipeline rejects. Use the native /api/chat endpoint for Ollama so we
+  // can set a real context window (CODEFORGE_OLLAMA_NUM_CTX, default 16K — plenty
+  // for these prompts without bloating CPU KV-cache). Other providers keep the
+  // OpenAI-compatible path.
+  const isOllama = provider.id === 'ollama';
+  const base = provider.baseUrl.replace(/\/+$/, '');
+  const numCtx = Number(process.env.CODEFORGE_OLLAMA_NUM_CTX) || 16384;
+
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    { role: 'user', content: userPrompt }
+  ];
+
+  const url = isOllama
+    ? base.replace(/\/v1$/, '') + '/api/chat'
+    : base + '/chat/completions';
+  const payload = isOllama
+    ? {
+        model,
+        messages,
+        stream: false,
+        options: { num_ctx: numCtx, temperature: 0.2, num_predict: 4096 }
+      }
+    : {
+        model,
+        messages,
+        temperature: 0.2,
+        max_tokens: 4096
+      };
 
   let lastError: unknown = new Error('LLM invocation failed');
 
@@ -113,10 +136,14 @@ export async function invokeLLM(params: LLMInvocationParams): Promise<string> {
       }
 
       const rawText = Buffer.concat(chunks).toString('utf-8');
-      const parsed = JSON.parse(rawText) as {
-        choices?: Array<{ message?: { content?: string | null } }>;
-      };
-      const content = parsed.choices?.[0]?.message?.content;
+      const parsed = JSON.parse(rawText) as
+        | { message?: { content?: string | null } }
+        | { choices?: Array<{ message?: { content?: string | null } }> };
+      // Native /api/chat returns { message: { content } }; OpenAI-compatible returns
+      // { choices: [{ message: { content } }] }.
+      const content = isOllama
+        ? (parsed as { message?: { content?: string | null } }).message?.content
+        : (parsed as { choices?: Array<{ message?: { content?: string | null } }> }).choices?.[0]?.message?.content;
       if (typeof content !== 'string') {
         throw new Error(`[${provider.name}] No content in completion response`);
       }

@@ -1,25 +1,26 @@
-import { PipelineState } from './state';
+import { PipelineState, SecurityIssue } from './state';
 import { architectNode, coderNode, securityScanNode, codeReviewNode, buildTestNode, debuggerNode, NodeOptions } from './nodes';
 import { fallbackSecurityScan } from './fallbackEngine';
+import { BuildResult } from './state';
 
 /**
  * CodeForgeOrchestrator — the multi-agent pipeline driver.
  *
- * (This was originally named `LangGraphOrchestrator` because the project once
- * depended on LangGraph. It is now a purpose-built sequential state machine, so
- * the class is named after the product, not the abandoned framework.)
- *
- * Pipeline: Architect → for each file { Coder → Security Scan → [Fix loop] }
+ * Pipeline: Architect → for each file { Coder → Security Scan → [Converging fix loop] }
  *           → Build/Test (sandboxed install+build) → [Debugger → Coder repair loop]
  *           → Final build-aware Review.
  *
- * Security fix loop: uses state.iterationCount / state.maxIterations — when the
- * security scan finds issues in a file and iterations remain, the coder is
- * re-invoked with the findings and the file is re-scanned before review.
- *
- * Build repair loop: uses state.buildAttempts / state.maxBuildAttempts — when the
- * real build fails, the Debugger diagnoses the output and the Coder re-generates
- * the implicated files until the build passes or the budget is exhausted.
+ * Loop invariants enforced here:
+ *  - SECURITY FIX LOOP is converging: it re-fixes a file only while critical
+ *    issues remain, budget (`maxIterations`) allows it, AND the previous fix
+ *    round measurably reduced the weighted severity of findings. A round that
+ *    doesn't improve anything terminates the loop instead of burning quota.
+ *  - BUILD REPAIR LOOP is verified: files are only regenerated when another
+ *    build will follow, so no repair is ever left unverified by the real
+ *    toolchain. An identical error signature across consecutive builds
+ *    short-circuits the loop (no-progress guard).
+ *  - RETRY ROUNDS ESCALATE: after the first failed attempt, provider selection
+ *    prefers keyed cloud models over the free/local ones that already failed.
  */
 export class CodeForgeOrchestrator {
   private state: PipelineState;
@@ -34,6 +35,28 @@ export class CodeForgeOrchestrator {
     return this.state;
   }
 
+  /** Weighted severity of an issue set — lower is better. Used to detect convergence. */
+  private static issueWeight(issues: SecurityIssue[]): number {
+    return issues.reduce((acc, i) => {
+      switch (i.severity) {
+        case 'critical': return acc + 8;
+        case 'high': return acc + 4;
+        case 'medium': return acc + 2;
+        case 'low': return acc + 1;
+        default: return acc;
+      }
+    }, 0);
+  }
+
+  /** Stable signature of a build failure — identical signatures mean no progress. */
+  private static errorSignature(r?: BuildResult): string {
+    if (!r) return '';
+    const errors = r.errors.length > 0
+      ? r.errors.map((e) => e.trim())
+      : [r.stderr.trim().split('\n').find(Boolean) || ''].filter(Boolean);
+    return [r.phase, r.exitCode ?? 'null', ...errors].join('|').slice(0, 800);
+  }
+
   public async *runStream(signal?: AbortSignal): AsyncGenerator<{ event: string; data: Partial<PipelineState> }> {
     const abortError = () => {
       const err = new Error('Generation aborted');
@@ -43,13 +66,16 @@ export class CodeForgeOrchestrator {
     const checkAbort = () => {
       if (signal?.aborted) throw abortError();
     };
+    // All nodes receive the external abort signal so an in-flight LLM call is
+    // cancelled immediately instead of waiting out its full timeout.
+    const nodeOpts = (extra: Partial<NodeOptions> = {}): NodeOptions => ({ ...this.options, signal, ...extra });
 
     // 1. Architect Node
     this.state.pipelineStatus = 'architecting';
     this.state.activeAgent = 'Architect';
     yield { event: 'state_update', data: { ...this.state } };
 
-    const architectUpdate = await architectNode(this.state, this.options);
+    const architectUpdate = await architectNode(this.state, nodeOpts());
     this.state = { ...this.state, ...architectUpdate };
     yield { event: 'state_update', data: { ...this.state } };
 
@@ -68,7 +94,7 @@ export class CodeForgeOrchestrator {
 
       // maxIterations is a PER-FILE fix budget: reset the counter at the start
       // of each file so one stubborn file can't consume the whole project's
-      // repair iterations (it now means "up to N fix rounds per file").
+      // repair iterations.
       this.state.iterationCount = 0;
 
       // 2. Coder Node
@@ -76,34 +102,42 @@ export class CodeForgeOrchestrator {
       this.state.activeAgent = 'Coder';
       yield { event: 'state_update', data: { ...this.state } };
 
-      const coderUpdate = await coderNode(this.state, this.options);
+      const coderUpdate = await coderNode(this.state, nodeOpts());
       this.state = { ...this.state, ...coderUpdate };
       yield { event: 'state_update', data: { ...this.state } };
 
-      // 3. Security Scan Node (+ fix loop)
+      // 3. Security Scan Node (+ converging fix loop)
       this.state.pipelineStatus = 'securing';
       this.state.activeAgent = 'Security Scan';
       yield { event: 'state_update', data: { ...this.state } };
 
-      const secUpdate = await securityScanNode(this.state, this.options);
+      const secUpdate = await securityScanNode(this.state, nodeOpts());
       this.state = { ...this.state, ...secUpdate };
       yield { event: 'state_update', data: { ...this.state } };
 
-      // Fix loop: if the scan found actionable issues and we still have
-      // iterations budgeted, have the coder fix them, then re-scan.
-      const currentFile = this.state.fileTree[this.state.currentFileIndex];
-      const issues = currentFile?.securityIssues || [];
-      const criticalOrHigh = issues.filter(
-        (i) => i.severity === 'critical' || i.severity === 'high'
+      // Fix loop: re-generate + re-scan while actionable issues remain, budget
+      // is left, and the previous round actually improved things.
+      let weight = CodeForgeOrchestrator.issueWeight(
+        this.state.fileTree[this.state.currentFileIndex]?.securityIssues || []
       );
+      while (
+        weight > 0 &&
+        this.state.iterationCount < this.state.maxIterations &&
+        !signal?.aborted
+      ) {
+        checkAbort();
+        const currentFile = this.state.fileTree[this.state.currentFileIndex];
+        const issues = currentFile?.securityIssues || [];
+        const criticalOrHigh = issues.filter(
+          (i) => i.severity === 'critical' || i.severity === 'high'
+        );
 
-      if (issues.length > 0 && this.state.iterationCount < this.state.maxIterations) {
         this.state.iterationCount += 1;
         this.state.pipelineStatus = 'coding';
         this.state.activeAgent = 'Coder';
         yield { event: 'state_update', data: { ...this.state } };
 
-        const fixOptions: NodeOptions = { ...this.options, fixIssues: issues };
+        const fixOptions = nodeOpts({ fixIssues: issues });
         const fixUpdate = await coderNode(this.state, fixOptions);
         this.state = { ...this.state, ...fixUpdate, iterationCount: this.state.iterationCount };
         yield { event: 'state_update', data: { ...this.state } };
@@ -112,12 +146,16 @@ export class CodeForgeOrchestrator {
         this.state.activeAgent = 'Security Scan';
         yield { event: 'state_update', data: { ...this.state } };
 
-        const reScan = await securityScanNode(this.state, this.options);
+        const reScan = await securityScanNode(this.state, nodeOpts());
         this.state = { ...this.state, ...reScan, iterationCount: this.state.iterationCount };
         yield { event: 'state_update', data: { ...this.state } };
 
         const reScannedFile = this.state.fileTree[this.state.currentFileIndex];
         const remaining = reScannedFile?.securityIssues?.length || 0;
+        const newWeight = CodeForgeOrchestrator.issueWeight(reScannedFile?.securityIssues || []);
+        const improved = newWeight < weight;
+        weight = newWeight;
+
         const log: Partial<PipelineState> = {
           logs: [
             ...this.state.logs,
@@ -127,14 +165,18 @@ export class CodeForgeOrchestrator {
               agent: 'Orchestrator',
               provider: 'CodeForge Engine',
               message: criticalOrHigh.length > 0
-                ? `Fix loop: re-generated ${currentFile.path} after ${criticalOrHigh.length} critical/high finding(s); ${remaining} issue(s) remain.`
-                : `Fix loop: re-generated ${currentFile.path} to address ${issues.length} finding(s); ${remaining} issue(s) remain.`,
-              type: remaining > 0 ? 'warn' : 'success'
+                ? `Fix round ${this.state.iterationCount}/${this.state.maxIterations}: re-generated ${currentFile.path} after ${criticalOrHigh.length} critical/high finding(s); ${remaining} issue(s) remain${improved ? '' : ', NO improvement — stopping fix loop'}.`
+                : `Fix round ${this.state.iterationCount}/${this.state.maxIterations}: re-generated ${currentFile.path} to address ${issues.length} finding(s); ${remaining} issue(s) remain${improved ? '' : ', NO improvement — stopping fix loop'}.`,
+              type: remaining === 0 ? 'success' : improved ? 'warn' : 'error'
             }
           ]
         };
         this.state = { ...this.state, ...log };
         yield { event: 'state_update', data: { ...this.state } };
+
+        // Convergence gate: a fix round that didn't reduce weighted severity
+        // won't magically succeed if repeated verbatim — stop and move on.
+        if (!improved) break;
       }
 
       // 4. Code Review Node
@@ -143,7 +185,7 @@ export class CodeForgeOrchestrator {
       this.state.activeAgent = 'Code Review';
       yield { event: 'state_update', data: { ...this.state } };
 
-      const reviewUpdate = await codeReviewNode(this.state, this.options);
+      const reviewUpdate = await codeReviewNode(this.state, nodeOpts());
       this.state = { ...this.state, ...reviewUpdate };
       yield { event: 'state_update', data: { ...this.state } };
 
@@ -151,10 +193,12 @@ export class CodeForgeOrchestrator {
       if (this.state.currentFileIndex >= this.state.fileTree.length - 1) break;
     }
 
-    // 5. Build/Test Agent + Debugger -> Coder repair loop.
+    // 5. Build/Test Agent + Debugger -> Coder VERIFIED repair loop.
     // Runs the REAL toolchain (npm install + build + optional test) in an
-    // isolated temp dir. On failure, the Debugger diagnoses the output and the
-    // Coder re-generates the implicated files; we re-build up to the budget.
+    // isolated temp dir. On failure: diagnose, repair implicated files, and
+    // RE-BUILD. Repairs never happen without a following rebuild, so every
+    // generated change is verified before review sees it.
+    let lastErrorSig = '';
     while (this.state.buildAttempts < this.state.maxBuildAttempts) {
       checkAbort();
 
@@ -162,19 +206,66 @@ export class CodeForgeOrchestrator {
       this.state.activeAgent = 'Build/Test';
       yield { event: 'state_update', data: { ...this.state } };
 
-      const buildUpdate = await buildTestNode(this.state, { ...this.options, signal });
+      const buildUpdate = await buildTestNode(this.state, nodeOpts());
       this.state = { ...this.state, ...buildUpdate };
       yield { event: 'state_update', data: { ...this.state } };
 
       const buildStatus = this.state.buildResult?.status;
       if (buildStatus !== 'failed') break; // passed or skipped
 
+      // No-progress guard: an identical error signature means the previous
+      // repair changed nothing — repeating it just burns quota.
+      const sig = CodeForgeOrchestrator.errorSignature(this.state.buildResult);
+      if (sig !== '' && sig === lastErrorSig) {
+        const stuckLog: Partial<PipelineState> = {
+          logs: [
+            ...this.state.logs,
+            {
+              id: 'log_build_stuck_' + Date.now(),
+              timestamp: new Date().toLocaleTimeString(),
+              agent: 'Orchestrator',
+              provider: 'CodeForge Engine',
+              message: 'Build produced the SAME errors as the previous round — no progress detected. Stopping the repair loop; final review will reflect the failure.',
+              type: 'error'
+            }
+          ]
+        };
+        this.state = { ...this.state, ...stuckLog };
+        yield { event: 'state_update', data: { ...this.state } };
+        break;
+      }
+      lastErrorSig = sig;
+
       this.state.buildAttempts += 1;
+
+      // Verified-repair invariant: only regenerate files when another rebuild
+      // will follow. Otherwise the final review would judge stale results.
+      if (this.state.buildAttempts >= this.state.maxBuildAttempts) {
+        const exhaustedLog: Partial<PipelineState> = {
+          logs: [
+            ...this.state.logs,
+            {
+              id: 'log_build_exhausted_' + Date.now(),
+              timestamp: new Date().toLocaleTimeString(),
+              agent: 'Orchestrator',
+              provider: 'CodeForge Engine',
+              message: `Build still failing after ${this.state.buildAttempts}/${this.state.maxBuildAttempts} attempts — repair budget exhausted. Final review will reflect the build failure.`,
+              type: 'error'
+            }
+          ]
+        };
+        this.state = { ...this.state, ...exhaustedLog };
+        yield { event: 'state_update', data: { ...this.state } };
+        break;
+      }
+
       this.state.pipelineStatus = 'debugging';
       this.state.activeAgent = 'Debugger';
       yield { event: 'state_update', data: { ...this.state } };
 
-      const debugUpdate = await debuggerNode(this.state, { ...this.options, signal });
+      // Round ≥2 escalates: prefer keyed cloud providers over what already failed.
+      const escalate = this.state.buildAttempts > 1;
+      const debugUpdate = await debuggerNode(this.state, nodeOpts({ escalate }));
       this.state = { ...this.state, ...debugUpdate };
       yield { event: 'state_update', data: { ...this.state } };
 
@@ -191,7 +282,7 @@ export class CodeForgeOrchestrator {
               timestamp: new Date().toLocaleTimeString(),
               agent: 'Orchestrator',
               provider: 'CodeForge Engine',
-              message: `Build still failing after ${this.state.buildAttempts} repair round(s) and no actionable fix directive was produced. Final review will reflect the build failure.`,
+              message: `No actionable fix directive was produced for the build failure. Final review will reflect the build failure.`,
               type: 'error'
             }
           ]
@@ -211,7 +302,7 @@ export class CodeForgeOrchestrator {
         this.state.activeAgent = 'Coder';
         yield { event: 'state_update', data: { ...this.state } };
 
-        const fixUpdate = await coderNode(this.state, { ...this.options, debugDirective: d.directive, signal });
+        const fixUpdate = await coderNode(this.state, nodeOpts({ debugDirective: d.directive, escalate }));
         this.state = { ...this.state, ...fixUpdate };
         yield { event: 'state_update', data: { ...this.state } };
 
@@ -243,7 +334,7 @@ export class CodeForgeOrchestrator {
             timestamp: new Date().toLocaleTimeString(),
             agent: 'Orchestrator',
             provider: 'CodeForge Engine',
-            message: `Repair round ${this.state.buildAttempts}/${this.state.maxBuildAttempts}: regenerated ${directives.length} file(s) from the Debugger's directives. Re-building...`,
+            message: `Repair round ${this.state.buildAttempts}/${this.state.maxBuildAttempts - 1}: regenerated ${directives.length} file(s) from the Debugger's directives${escalate ? ' (provider escalation ON)' : ''}. Re-building...`,
             type: 'warn'
           }
         ]
@@ -259,7 +350,7 @@ export class CodeForgeOrchestrator {
     this.state.activeAgent = 'Code Review';
     yield { event: 'state_update', data: { ...this.state } };
 
-    const finalReview = await codeReviewNode(this.state, { ...this.options, finalReview: true, signal });
+    const finalReview = await codeReviewNode(this.state, nodeOpts({ finalReview: true }));
     this.state = { ...this.state, ...finalReview };
     yield { event: 'state_update', data: { ...this.state } };
 

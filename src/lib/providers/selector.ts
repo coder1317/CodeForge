@@ -30,13 +30,38 @@ const TASK_PREFERENCES: Record<TaskType, string[]> = {
 // endpoints when no key is required.
 export const ZERO_KEY = 'unused';
 
+/** Resolve the API key a provider would use right now (BYOK first, then env). */
+function resolveKey(
+  provider: LLMProviderConfig,
+  byokKeys: BYOKMap,
+  envVars: Record<string, string | undefined>
+): string | undefined {
+  const byokKey = byokKeys[provider.id as keyof BYOKMap];
+  if (byokKey && byokKey.trim() !== '') return byokKey.trim();
+  if (provider.envVarName && envVars[provider.envVarName]) return envVars[provider.envVarName];
+  return undefined;
+}
+
 export function selectProvider(
   taskType: TaskType,
   byokKeys: BYOKMap = {},
   envVars: Record<string, string | undefined> = {},
-  excludeIds: string[] = []
+  excludeIds: string[] = [],
+  escalate = false
 ): ProviderSelectionResult | null {
-  const preferences = TASK_PREFERENCES[taskType] || TASK_PREFERENCES.code;
+  let preferences = TASK_PREFERENCES[taskType] || TASK_PREFERENCES.code;
+
+  // Escalation mode (used on retry rounds after a failure): put providers that
+  // actually have keys available FIRST, so round 2 doesn't just re-ask the same
+  // local/free model that already failed. Relative order is preserved otherwise.
+  if (escalate) {
+    const keyed = preferences.filter((id) => {
+      const p = PROVIDER_POOL[id];
+      return Boolean(p && resolveKey(p, byokKeys, envVars));
+    });
+    const rest = preferences.filter((id) => !keyed.includes(id));
+    preferences = [...keyed, ...rest];
+  }
 
   for (const providerId of preferences) {
     if (excludeIds.includes(providerId)) continue;
@@ -51,17 +76,10 @@ export function selectProvider(
     }
 
     // Check key availability
-    let apiKey: string | undefined;
-    let isBYOK = false;
-
-    // Check BYOK first
-    const byokKey = byokKeys[providerId as keyof BYOKMap];
-    if (byokKey && byokKey.trim() !== '') {
-      apiKey = byokKey.trim();
-      isBYOK = true;
-    } else if (provider.envVarName && envVars[provider.envVarName]) {
-      apiKey = envVars[provider.envVarName];
-    }
+    const apiKey = resolveKey(provider, byokKeys, envVars);
+    const isBYOK = Boolean(
+      byokKeys[providerId as keyof BYOKMap] && byokKeys[providerId as keyof BYOKMap]?.trim() !== ''
+    );
 
     // Free / zero-key provider handling (Ollama or LLM7)
     if (!provider.requiresKey || provider.free) {
